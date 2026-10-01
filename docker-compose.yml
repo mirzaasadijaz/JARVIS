@@ -1,0 +1,24 @@
+# NOTE, read before using this: run_voice.py is deliberately NOT a
+# service here. Desktop automation (PyAutoGUI) needs access to Asad's
+# real screen, mouse, and audio devices — a container only sees its own
+# virtual environment, not the host's actual desktop, and that doesn't
+# translate the same way across Linux/Windows/Mac. Run
+# `python run_voice.py` natively on the host machine.
+#
+# The WhatsApp bridge (whatsapp_bridge/server.js) isn't a service here
+# either — it needs a persistent local session folder from the QR-code
+# login, which is simplest to just run natively alongside run_voice.py:
+#   cd whatsapp_bridge && npm install && npm start
+#
+# Only jarvis-server (the WhatsApp webhook, a pure network service)
+# genuinely benefits from containerizing.
+
+services:
+  jarvis-server:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

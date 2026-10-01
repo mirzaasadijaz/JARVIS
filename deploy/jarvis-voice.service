@@ -1,0 +1,25 @@
+# Example systemd unit for run_voice.py — copy to
+# /etc/systemd/user/jarvis-voice.service (or /etc/systemd/system/ with a
+# hardcoded User=), then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now jarvis-voice
+#
+# Uses graphical.target (not multi-user.target) and an explicit DISPLAY,
+# since this process needs a real X11 session for desktop automation —
+# unlike a typical background service, it can't run headless.
+
+[Unit]
+Description=Jarvis voice loop
+After=graphical-session.target sound.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/jarvis
+Environment=DISPLAY=:0
+ExecStart=%h/jarvis/venv/bin/python run_voice.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

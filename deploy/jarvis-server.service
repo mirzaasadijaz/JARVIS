@@ -1,0 +1,20 @@
+# Example systemd unit for run_server.py — a plain network service, no
+# display needed. Copy to /etc/systemd/system/jarvis-server.service:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now jarvis-server
+# Replace 'asad' below with your actual username/path.
+
+[Unit]
+Description=Jarvis WhatsApp webhook server
+After=network.target
+
+[Service]
+Type=simple
+User=asad
+WorkingDirectory=/home/asad/jarvis
+ExecStart=/home/asad/jarvis/venv/bin/python run_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

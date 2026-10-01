@@ -1,0 +1,61 @@
+# --- core / orchestration ---
+langgraph
+langgraph-checkpoint-sqlite
+langchain
+langchain-anthropic          # swap for langchain-openai / langchain-google-genai / langchain-groq
+langchain-google-genai
+python-dotenv
+pydantic-settings
+tenacity
+langsmith                    # optional — Phase 8
+
+# --- voice ---
+sounddevice
+openwakeword==0.4.0           # pinned — 0.4.0's bundled models are all ONNX; newer versions pull in a tflite-only model, and tflite-runtime has no wheel for Python 3.13
+webrtcvad                     # voice-activity detection during active conversation
+setuptools<81                 # webrtcvad needs pkg_resources, removed in newer setuptools
+deepgram-sdk
+elevenlabs
+# tkinter (PIN popup) is Python's standard library — ships with the
+# standard Windows/macOS installers. On Linux, install the system
+# package if it's missing: apt install python3-tk
+
+# --- desktop automation (needs a real display — see Dockerfile note) ---
+pyautogui
+mss
+pyperclip
+
+# --- whatsapp server ---
+fastapi
+uvicorn
+slowapi
+requests
+
+# --- scheduling ---
+apscheduler
+
+# --- memory / embeddings ---
+chromadb
+voyageai                      # or swap in sentence-transformers for the free local option
+
+# --- documents / RAG ---
+pypdf
+python-docx
+openpyxl
+pytesseract                   # also needs the Tesseract binary: apt-get install tesseract-ocr (Windows: separate installer)
+
+# --- email ---
+google-api-python-client
+google-auth-oauthlib
+
+# --- research / maps / browser ---
+wikipedia
+geopy
+playwright
+
+# --- status indicator (Phase 8, needs a real GTK/Win32/Cocoa backend) ---
+pystray
+Pillow
+
+# after installing, also run once:
+#   playwright install chromium
