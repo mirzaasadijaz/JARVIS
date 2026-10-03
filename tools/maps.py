@@ -10,7 +10,8 @@ in March 2025).
 from geopy.geocoders import Nominatim
 from langchain_core.tools import tool
 
-_geolocator = Nominatim(user_agent="jarvis-personal-assistant")
+# geopy's default timeout is 1 second, which Nominatim often exceeds (-> GeocoderTimedOut).
+_geolocator = Nominatim(user_agent="jarvis-personal-assistant", timeout=10)
 
 
 @tool

@@ -1,0 +1,213 @@
+/**
+ * Sending logic for the bridge — deliberately free of Express/Puppeteer so it
+ * can be unit-tested against a fake client (see test/sender.test.js).
+ *
+ * WHY THIS FILE EXISTS — the `No LID for user` error
+ * --------------------------------------------------
+ * WhatsApp is moving every account to "LID" addressing (an opaque id such as
+ * `22952607240241@lid` instead of the phone number `<number>@c.us`).
+ * whatsapp-web.js 1.34.x drives the real WhatsApp Web page, and that page
+ * throws `No LID for user` from its own `toUserLidOrThrow()` whenever it is
+ * asked to open/send to a 1:1 chat whose phone <-> LID mapping it has not
+ * loaded yet. Two places in client.sendMessage() can trigger it:
+ *
+ *   1. WWebJS.getChat -> findOrCreateLatestChat   (chat not in the store yet:
+ *      a stranger who just messaged you, a number you never chatted with, or
+ *      a `...@c.us` id that is really a LID with the digits copied over)
+ *   2. WWebJS.sendSeen                            (the implicit "mark as read")
+ *
+ * 1.34.7 is the newest published release, so there is no upgrade that fixes
+ * it. What works is to (a) never trigger the fragile implicit sendSeen,
+ * (b) ask the library to establish the mapping for unknown contacts
+ * (client.getContactLidAndPhone — added in 1.34.0 for exactly this), and
+ * (c) retry with every id the lookup gives us. Anything that is NOT a LID
+ * problem (session closed, bad input, ...) is reported immediately and never
+ * retried, so a message can't be sent twice.
+ */
+
+"use strict";
+
+/** An error that already knows which HTTP status the REST API should use. */
+class BridgeError extends Error {
+  constructor(message, status = 500, code = "send_failed") {
+    super(message);
+    this.name = "BridgeError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+/** sendMessage resolved but returned nothing => WhatsApp could not open the chat. */
+class ChatNotOpenedError extends Error {
+  constructor(id) {
+    super(`WhatsApp could not open a chat with ${id}`);
+    this.name = "ChatNotOpenedError";
+  }
+}
+
+const LID_ERROR = /no lid for user/i;
+const SESSION_GONE = /target closed|session closed|browser has disconnected|execution context was destroyed|detached frame|not connected/i;
+
+const errText = (err) => String((err && err.message) || err || "");
+const firstLine = (s) => errText(s).split("\n")[0].trim();
+
+function isLidError(err) {
+  return LID_ERROR.test(errText(err));
+}
+
+/** Failures worth retrying with a different id / after a mapping lookup. */
+function isRecoverable(err) {
+  return isLidError(err) || err instanceof ChatNotOpenedError;
+}
+
+/**
+ * Turns whatever the caller passed as `to` into a chat id.
+ *   "923001234567"          -> phone (bare)  923001234567@c.us
+ *   "+92 300 1234567"       -> phone (bare)  923001234567@c.us
+ *   "923001234567@c.us"     -> phone         923001234567@c.us
+ *   "22952607240241@lid"    -> lid           22952607240241@lid
+ *   "1203...@g.us" etc.     -> passthrough   (groups/channels: no LID logic)
+ */
+function normalizeTarget(to) {
+  if (typeof to !== "string" && typeof to !== "number") {
+    throw new BridgeError("'to' is required (phone number in international format, or a WhatsApp chat id)", 400, "bad_request");
+  }
+  const raw = String(to).trim();
+  if (!raw) {
+    throw new BridgeError("'to' is required (phone number in international format, or a WhatsApp chat id)", 400, "bad_request");
+  }
+
+  const at = raw.indexOf("@");
+  const user = at === -1 ? raw : raw.slice(0, at);
+  const server = at === -1 ? "c.us" : raw.slice(at + 1).toLowerCase();
+  const digits = user.replace(/\D/g, "");
+
+  if (server === "c.us") {
+    if (digits.length < 7 || digits.length > 15) {
+      throw new BridgeError(
+        `'${raw}' is not a valid phone number — use international format without '+', e.g. 923001234567`,
+        400,
+        "bad_request"
+      );
+    }
+    return { kind: "phone", bare: at === -1, digits, id: `${digits}@c.us` };
+  }
+  if (server === "lid") {
+    if (!digits) throw new BridgeError(`'${raw}' is not a valid WhatsApp LID`, 400, "bad_request");
+    return { kind: "lid", bare: false, digits, id: `${digits}@lid` };
+  }
+  return { kind: "passthrough", bare: false, digits, id: raw }; // @g.us, @newsletter, @broadcast, ...
+}
+
+/** Maps low-level failures onto an HTTP status + a message a human can act on. */
+function toBridgeError(err) {
+  if (err instanceof BridgeError) return err;
+  const msg = firstLine(err) || "Unknown error";
+  if (SESSION_GONE.test(errText(err))) {
+    return new BridgeError(
+      `The WhatsApp browser session is not available (${msg}). Restart the bridge (npm start).`,
+      503,
+      "session_unavailable"
+    );
+  }
+  return new BridgeError(msg, 500, "send_failed");
+}
+
+/**
+ * Asks WhatsApp to establish the phone <-> LID mapping for an unknown contact.
+ * Never throws — it is a best-effort step; returns {} if nothing was learned.
+ */
+async function lookupMapping(client, id, log) {
+  try {
+    if (typeof client.getContactLidAndPhone !== "function") return {};
+    const res = await client.getContactLidAndPhone(id);
+    const first = Array.isArray(res) ? res[0] : res;
+    return { lid: first && first.lid, pn: first && first.pn };
+  } catch (err) {
+    log.warn(`[send] LID lookup for ${id} failed: ${firstLine(err)}`);
+    return {};
+  }
+}
+
+/**
+ * For a bare phone number (typed by a person / chosen by the LLM) confirm it is
+ * actually on WhatsApp. Without this, WhatsApp happily "sends" to nobody and the
+ * message sits on a clock icon forever. This lookup also loads the LID mapping,
+ * which prevents the error in the first place.
+ * Returns the id to use first.
+ */
+async function verifyRegistered(client, target, log) {
+  let wid;
+  try {
+    wid = await client.getNumberId(target.digits);
+  } catch (err) {
+    // Couldn't ask — don't block the send, just try the obvious id.
+    log.warn(`[send] getNumberId(${target.digits}) failed: ${firstLine(err)}`);
+    return target.id;
+  }
+  if (!wid) {
+    throw new BridgeError(
+      `${target.digits} is not registered on WhatsApp. Check the number — international format, no '+' and no leading zero (e.g. 923001234567).`,
+      404,
+      "not_on_whatsapp"
+    );
+  }
+  return wid._serialized || target.id;
+}
+
+/**
+ * Sends `content` (string or MessageMedia) to `to`, surviving `No LID for user`.
+ * Resolves { to, via, messageId } describing what finally worked; throws BridgeError.
+ */
+async function sendWithFallback(client, to, content, options = {}, log = console) {
+  const target = normalizeTarget(to);
+  // sendSeen:false -> skip the implicit "mark chat as read", the second source of the error.
+  const sendOptions = { ...options, sendSeen: false };
+
+  const firstId = target.kind === "phone" && target.bare ? await verifyRegistered(client, target, log) : target.id;
+
+  const failures = [];
+  const attempt = async (id, via) => {
+    try {
+      const sent = await client.sendMessage(id, content, sendOptions);
+      if (!sent) throw new ChatNotOpenedError(id);
+      if (via !== "direct") log.info(`[send] delivered via ${via} (${id})`);
+      return { to: id, via, messageId: sent.id && sent.id._serialized };
+    } catch (err) {
+      if (!isRecoverable(err)) throw toBridgeError(err); // not a LID problem: report, never retry
+      failures.push(`${via} ${id}: ${firstLine(err)}`);
+      return null;
+    }
+  };
+
+  let done = await attempt(firstId, "direct");
+  if (done) return done;
+
+  if (target.kind !== "passthrough") {
+    // Establish the mapping, then retry the same id (the lookup is the actual fix),
+    // followed by any other id the lookup revealed.
+    const mapping = await lookupMapping(client, firstId, log);
+    const candidates = [...new Set([firstId, mapping.lid, mapping.pn].filter(Boolean))];
+    for (const id of candidates) {
+      done = await attempt(id, id === firstId ? "retry-after-lookup" : "alternate-id");
+      if (done) return done;
+    }
+  }
+
+  throw new BridgeError(
+    `WhatsApp refused to open the chat ("No LID for user"). Tried: ${failures.join(" | ")}. ` +
+      `The contact may not have messaged this account yet — ask them to send a message first, ` +
+      `or restart the bridge so WhatsApp Web reloads its contact mapping.`,
+    502,
+    "no_lid"
+  );
+}
+
+module.exports = {
+  BridgeError,
+  ChatNotOpenedError,
+  isLidError,
+  normalizeTarget,
+  toBridgeError,
+  sendWithFallback,
+};

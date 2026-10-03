@@ -35,7 +35,10 @@ def build_middleware(model_string: str) -> list:
         SummarizationMiddleware(model=model_string, trigger=("tokens", 4000), keep=("messages", 20)),
         PIIMiddleware("email", strategy="redact", apply_to_input=True),
         HumanInTheLoopMiddleware(interrupt_on=SENSITIVE_TOOLS),
-        ToolCallLimitMiddleware(thread_limit=25, exit_behavior="continue"),
+        # run_limit = per message (a runaway-loop guard). thread_limit counted tool calls over the
+        # whole life of a saved conversation, so after 25 uses in total Jarvis refused every
+        # tool on that WhatsApp/voice thread for good (threads are persisted in data/jarvis.db).
+        ToolCallLimitMiddleware(run_limit=25, exit_behavior="continue"),
         ToolRetryMiddleware(max_retries=2),
         ModelRetryMiddleware(max_retries=2),
     ]

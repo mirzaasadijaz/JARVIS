@@ -49,27 +49,3 @@ def search_notes(query: str, n_results: int = 5) -> str:
     if not documents:
         return "No matching notes found."
     return "\n".join(f"- {doc}" for doc in documents)
-
-
-@tool
-def save_note(text: str) -> str:
-    """Save a note for later semantic search."""
-    import uuid
-
-    _get_collection().add(documents=[text], ids=[str(uuid.uuid4())])
-    return "Saved."
-
-
-@tool
-def search_notes(query: str, n_results: int = 5) -> str:
-    """Search past notes by meaning, not exact keywords.
-
-    Args:
-        query: What you're trying to recall
-        n_results: How many matches to return (default 5)
-    """
-    results = _get_collection().query(query_texts=[query], n_results=n_results)
-    documents = results.get("documents", [[]])[0]
-    if not documents:
-        return "No matching notes found."
-    return "\n".join(f"- {doc}" for doc in documents)

@@ -4,7 +4,8 @@
   "description": "Connects Jarvis to a real WhatsApp account via whatsapp-web.js — no Docker, no database, no Redis.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/sender.test.js test/server.test.js"
   },
   "license": "ISC",
   "dependencies": {

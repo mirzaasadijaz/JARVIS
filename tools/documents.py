@@ -65,7 +65,15 @@ def _extract_text(path: str) -> str:
         # OCR only — good for scans/screenshots with clear text. For
         # messier photos (whiteboards, handwriting), swap this for a
         # Claude vision call instead; nothing else here needs to change.
-        return pytesseract.image_to_string(Image.open(path))
+        try:
+            with Image.open(path) as image:  # closed afterwards, so the file can be deleted on Windows
+                return pytesseract.image_to_string(image)
+        except pytesseract.TesseractNotFoundError:
+            # ValueError is this module's "tell the user" error (the webhook replies with it as-is).
+            raise ValueError(
+                "I can't read text from images yet: the Tesseract OCR program isn't installed on the "
+                "Jarvis computer (Windows installer: github.com/UB-Mannheim/tesseract/wiki)."
+            ) from None
     if ext in {".txt", ".md"}:
         with open(path, encoding="utf-8", errors="ignore") as f:
             return f.read()

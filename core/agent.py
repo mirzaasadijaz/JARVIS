@@ -16,6 +16,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from config import settings
 from core.middleware import build_middleware
+from core.runner import ask_jarvis
 from tools.browser import browser_click, browser_get_html, browser_get_text, browser_navigate, browser_type
 from tools.coding import apply_patch, read_file, write_file
 from tools.desktop import click_at, open_application, press_key, read_clipboard, take_screenshot, type_text, write_clipboard
@@ -84,6 +85,17 @@ agent = create_agent(
 scheduler.start()
 
 
+def _ask_in_terminal(action_requests: list) -> list:
+    """Terminal only: answers human-in-the-loop approval requests by asking you.
+    (WhatsApp and the voice loop can't ask, so they decline — see core/runner.py.)"""
+    decisions = []
+    for request in action_requests:
+        print(f"\n  Jarvis wants to run {request['name']} with {request['args']}")
+        approved = input("  Approve? [y/N] ").strip().lower() in {"y", "yes"}
+        decisions.append({"type": "approve"} if approved else {"type": "reject", "message": "The user declined."})
+    return decisions
+
+
 if __name__ == "__main__":
     thread_id = "terminal-test"
     print(f"Jarvis (brain: {provider}, {len(ALL_TOOLS)} tools). Type 'quit' to exit.\n")
@@ -93,8 +105,9 @@ if __name__ == "__main__":
             break
         if not user_input:
             continue
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": user_input}]},
-            config={"configurable": {"thread_id": thread_id}},
-        )
-        print(f"Jarvis: {result['messages'][-1].content}\n")
+        try:
+            reply = ask_jarvis(agent, user_input, thread_id, on_interrupt=_ask_in_terminal)
+        except Exception as exc:  # noqa: BLE001 — keep the test loop alive
+            print(f"Jarvis: (that failed — {type(exc).__name__}: {exc})\n")
+            continue
+        print(f"Jarvis: {reply or '(no reply)'}\n")

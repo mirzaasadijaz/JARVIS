@@ -36,6 +36,13 @@ A QR code prints in that terminal — scan it with WhatsApp on your
 phone: **Settings → Linked Devices → Link a Device**. The session is
 saved locally in `whatsapp_bridge/.wwebjs_auth/`, so you only scan once.
 
+Optional bridge settings (environment variables, same way as `WEBHOOK_SECRET`):
+`BRIDGE_PORT` (default 3001), `JARVIS_WEBHOOK_URL` (default
+`http://localhost:8000/webhook`), `MAX_MEDIA_MB` (default 25), and
+`BRIDGE_HOST` — set it to `127.0.0.1` if Jarvis and the bridge run on the
+same machine, so other devices on your network can't reach the bridge's
+(unauthenticated) send endpoints. Leave it unset if Jarvis runs in Docker.
+
 One-time setup script, only needed if using the Gmail tools:
 ```bash
 python scripts/setup_gmail_oauth.py
@@ -93,28 +100,65 @@ the agent can actually *decide* to call lives in `tools/`.
 | `deploy/` | Example systemd units for always-on operation (Python processes only — the bridge needs its own, e.g. via `pm2` or Task Scheduler on Windows) |
 
 
+## Troubleshooting WhatsApp
+
+**`No LID for user`** (HTTP 500 from the bridge). WhatsApp is moving accounts
+to "LID" addressing (`12345…@lid` instead of `phone@c.us`), and
+whatsapp-web.js 1.34.x throws this when WhatsApp Web hasn't loaded the
+phone↔LID mapping for a chat. 1.34.7 is the newest release, so upgrading
+doesn't help; `whatsapp_bridge/sender.js` works around it (no implicit
+mark-as-read, asks WhatsApp to resolve the contact, then retries with every
+id it learns) and explains in plain words when it still can't. If you see a
+`no_lid` error in the bridge log, the contact has probably never messaged
+this account — ask them to send one message first.
+
+**Which chats does Jarvis answer?** Only 1:1 chats. Groups, status updates,
+channels, stickers, reactions and other things Jarvis can't act on are ignored
+by the bridge, so it can't spam a group as you or post a status.
+
+**Sensitive actions (send message/email, write files, open apps).** They need
+approval (`core/middleware.py`). Over WhatsApp and voice there is nobody to
+ask, so Jarvis declines and tells you it needs your confirmation; to actually
+approve one, use the terminal tester: `python core/agent.py` asks y/n.
+
+**Image attachments** are read with Tesseract OCR, a separate program. On
+Windows install it from https://github.com/UB-Mannheim/tesseract/wiki — until
+then Jarvis replies that it can't read images instead of failing.
+
+**Where do errors show up?** One readable line per problem in the
+`run_server.py` window (and in the bridge window); set `LOG_LEVEL=DEBUG` in
+`.env` for full tracebacks.
+
+**Tests** (no phone, API keys or network needed):
+```bash
+cd whatsapp_bridge && npm test      # bridge: sending, LID fallbacks, incoming-message filtering
+pip install pytest && pytest        # server: webhook, reply delivery, approvals, voice, OCR
+```
+
 ## Known limitations, flagged honestly rather than hidden
 
-- **`whatsapp_bridge/server.js`** was verified as far as this sandbox
-  allows: dependencies install, syntax checks clean, and the
-  HMAC-SHA256 webhook signature was cross-checked byte-for-byte against
-  Python's — Node's output and Python's `verify_webhook_signature`
-  agree exactly. What couldn't be tested here: actually scanning a QR
-  code and holding a live WhatsApp session (this sandbox has no way to
-  launch a real browser against WhatsApp's servers). That first
-  `npm start` is the real first test.
-- **Dictation Mode's mic session** (in `whatsapp_server/webhook.py`) is
-  separate from the always-on one in `voice/loop.py`. Running both
-  `run_voice.py` and `run_server.py` at once means two processes
-  competing for one microphone. Needs a small handoff (e.g. a row in
-  `data/jarvis.db` that `voice/loop.py` polls) — not built yet.
+- **`whatsapp_bridge/`** is tested against a fake WhatsApp client that
+  reproduces the library's real behaviour, including the `No LID for user`
+  failures (`npm test`), and the HMAC webhook signature was cross-checked
+  against Python's. What can't be tested without your phone is a live
+  WhatsApp session, so the first real conversation is the final check.
 - **`tools/desktop.py`, `core/status.py`, and `core/pin_lock.py`** need
   a real display (PyAutoGUI, pystray, and tkinter's popup window all
   require one) and couldn't be functionally tested in the sandbox this
   was built in — only syntax-checked / import-checked. Verify on your
   actual machine. tkinter ships with standard Python on Windows, so no
   extra install should be needed there.
-- **`whatsapp_server/evolution_client.py` and `tools/social.py`**
-  are written to each API's documented REST conventions but couldn't
-  be tested against a real running Evolution API instance or real Meta
-  credentials — confirm exact endpoint paths against current docs.
+- **`tools/social.py`** is written to the Meta Graph API's documented REST
+  conventions but couldn't be tested against real Meta credentials —
+  confirm exact endpoint paths and the API version against current docs.
+- **Access control:** every 1:1 chat that messages the linked WhatsApp
+  account gets an answer from the full agent. Only the tools listed in
+  `core/middleware.py` (`SENSITIVE_TOOLS`) need approval; the rest run
+  freely for anyone who messages the account — including `read_file`,
+  `search_inbox`, `take_screenshot`, and the desktop controls `type_text`,
+  `press_key` and `click_at`. `JARVIS_OWNER_NUMBER` is not enforced yet. Add
+  an allow-list in `whatsapp_server/webhook.py` (and/or widen `SENSITIVE_TOOLS`)
+  before linking an account you care about.
+- **Docker:** the `jarvis-server` image can't start headless as written —
+  `core/agent.py` imports `tools/desktop.py`, and PyAutoGUI fails on import
+  without a display. Run `python run_server.py` natively (as above).

@@ -28,6 +28,7 @@ import sounddevice as sd
 
 from core.agent import agent
 from core.pin_lock import prompt_for_pin
+from core.runner import ask_jarvis
 from voice.audio_utils import frames_to_wav_bytes, play_pcm
 from voice.stt import transcribe
 from voice.tts import SAMPLE_RATE as TTS_SAMPLE_RATE
@@ -60,25 +61,46 @@ def _wait_for_wake_word() -> None:
         stream.close()
 
 
+def _speak(text: str) -> None:
+    play_pcm(synthesize_speech(text), TTS_SAMPLE_RATE)
+
+
 def _handle_utterance(frames, mic_sample_rate: int) -> bool:
     """Returns False if this utterance was "bye jarvis" (caller should
-    exit), True otherwise."""
-    text = transcribe(frames_to_wav_bytes(frames, mic_sample_rate))
+    exit), True otherwise.
+
+    One failed turn (speech-to-text / LLM / text-to-speech outage, quota, a
+    dropped connection ...) must not end the whole voice session, so every
+    step is guarded: the problem is printed on one line and the loop carries on.
+    """
+    try:
+        text = transcribe(frames_to_wav_bytes(frames, mic_sample_rate))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[voice] couldn't transcribe that: {type(exc).__name__}: {exc}")
+        return True
     if not text.strip():
         return True
 
     print(f"You: {text}")
     if EXIT_PHRASE in text.lower():
-        play_pcm(synthesize_speech("Goodbye."), TTS_SAMPLE_RATE)
+        try:
+            _speak("Goodbye.")
+        except Exception as exc:  # noqa: BLE001 — still exit even if the goodbye can't be spoken
+            print(f"[voice] couldn't speak the goodbye: {type(exc).__name__}: {exc}")
         return False
 
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": text}]},
-        config={"configurable": {"thread_id": THREAD_ID}},
-    )
-    reply = result["messages"][-1].content
-    print(f"Jarvis: {reply}")
-    play_pcm(synthesize_speech(reply), TTS_SAMPLE_RATE)
+    try:
+        # ask_jarvis returns plain text, declines (instead of hanging on) actions that need
+        # approval, and never hands back a list of content blocks. See core/runner.py.
+        reply = ask_jarvis(agent, text, THREAD_ID) or "I don't have a reply for that."
+        print(f"Jarvis: {reply}")
+        _speak(reply)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[voice] that turn failed: {type(exc).__name__}: {exc}")
+        try:
+            _speak("Sorry, something went wrong. Please try again.")
+        except Exception:  # noqa: BLE001 — speech itself is what's broken; nothing more to do
+            pass
     return True
 
 
