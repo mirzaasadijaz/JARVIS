@@ -110,10 +110,21 @@ async function forwardToJarvis(payload) {
   });
 }
 
+const recentIds = new Set();
+function alreadyHandled(msg) {
+  const id = msg.id && msg.id._serialized;
+  if (!id) return false;
+  if (recentIds.has(id)) return true;
+  recentIds.add(id);
+  if (recentIds.size > 1000) recentIds.delete(recentIds.values().next().value);
+  return false;
+}
+
 async function handleIncoming(msg) {
   try {
     if (msg.fromMe) return;
     if (msg.isStatus || !PRIVATE_CHAT.test(msg.from || "")) return;
+    if (alreadyHandled(msg)) return;
 
     // msg.from is the chat id exactly as WhatsApp gives it: "<digits>@c.us" or "<digits>@lid".
     // Jarvis replies to this same id (see sender.js for how it is made to work for both).

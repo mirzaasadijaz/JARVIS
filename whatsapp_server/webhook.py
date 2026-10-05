@@ -49,6 +49,38 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # Same logger uvicorn uses, so these lines look like the rest of the server output.
 logger = logging.getLogger("uvicorn.error")
 
+from pathlib import Path
+
+INTRO = "Hi! I'm Asad's bot."  # first reply to each new sender; set "" to turn off
+_GREETED_FILE = Path(__file__).resolve().parent.parent / "data" / "greeted_senders.json"
+_greeted_lock = threading.Lock()
+
+
+def _load_greeted() -> set:
+    try:
+        data = json.loads(_GREETED_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {item for item in data if isinstance(item, str)} if isinstance(data, list) else set()
+
+
+def _is_new_sender(sender: str) -> bool:
+    with _greeted_lock:
+        return sender not in _load_greeted()
+
+
+def _mark_greeted(sender: str) -> None:
+    try:
+        with _greeted_lock:
+            greeted = _load_greeted()
+            greeted.add(sender)
+            _GREETED_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _GREETED_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sorted(greeted)), encoding="utf-8")
+            os.replace(tmp, _GREETED_FILE)
+    except OSError as exc:
+        logger.warning("Could not remember that %s was greeted: %s", sender, exc)
+
 _EXTENSION_FROM_MIMETYPE = {
     "application/pdf": ".pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
@@ -120,7 +152,12 @@ def _handle_smart_conversation(sender: str, text: str, is_voice: bool) -> None:
     try:
         with _lock_for(sender):
             reply = ask_jarvis(agent, text, thread_id=f"whatsapp-{sender}") or _NO_REPLY
+            first_time = bool(INTRO) and _is_new_sender(sender)
+            if first_time:
+                reply = f"{INTRO}\n\n{reply}"
             _deliver_reply(sender, reply, as_voice=is_voice)
+            if first_time:
+                _mark_greeted(sender)
     except BridgeError as exc:
         # The reply exists but WhatsApp wouldn't take it. The same channel is broken, so there
         # is nobody to apologise to — log why (the message says what to do) and move on.

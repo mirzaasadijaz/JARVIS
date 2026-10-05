@@ -155,28 +155,120 @@ async function verifyRegistered(client, target, log) {
   return wid._serialized || target.id;
 }
 
-/**
- * Sends `content` (string or MessageMedia) to `to`, surviving `No LID for user`.
- * Resolves { to, via, messageId } describing what finally worked; throws BridgeError.
- */
-async function sendWithFallback(client, to, content, options = {}, log = console) {
-  const target = normalizeTarget(to);
-  // sendSeen:false -> skip the implicit "mark chat as read", the second source of the error.
-  const sendOptions = { ...options, sendSeen: false };
+const config = { graceMs: 500, attemptTimeoutMs: 60000 };
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// One send at a time, so "was MY message created?" below can't be confused with another send.
+let queue = Promise.resolve();
+function serialized(job) {
+  const run = queue.then(job);
+  queue = run.catch(() => {});
+  return run;
+}
+
+// WhatsApp emits "message_create" as soon as a message is queued, even if sendMessage() then fails.
+function watchDispatch(client, content) {
+  if (typeof client.on !== "function" || typeof client.removeListener !== "function") {
+    return { supported: false, created: () => null, stop() {} };
+  }
+  const isText = typeof content === "string";
+  const wanted = isText ? content.trim() : null;
+  let created = null;
+  const onCreate = (msg) => {
+    if (created || !msg || !msg.fromMe) return;
+    if (isText ? String(msg.body || "").trim() === wanted : msg.hasMedia) created = msg;
+  };
+  client.on("message_create", onCreate);
+  return { supported: true, created: () => created, stop: () => client.removeListener("message_create", onCreate) };
+}
+
+// Runs INSIDE the WhatsApp Web page: is a matching message we sent already in its message store?
+function pageHasOutgoing(body, isMedia, since) {
+  const { Msg, Chat } = window.require("WAWebCollections");
+  let list = typeof Msg.getModelsArray === "function" ? Msg.getModelsArray() : null;
+  if (!list) {
+    list = [];
+    for (const chat of Chat.getModelsArray()) {
+      if (chat.msgs && typeof chat.msgs.getModelsArray === "function") list.push(...chat.msgs.getModelsArray());
+    }
+  }
+  return list.some(
+    (m) =>
+      m &&
+      m.id &&
+      m.id.fromMe &&
+      m.t >= since &&
+      (isMedia ? m.type === "ptt" || m.type === "audio" : typeof m.body === "string" && m.body.trim() === body)
+  );
+}
+
+async function storeHasOutgoing(client, content, since, log) {
+  if (!client.pupPage || typeof client.pupPage.evaluate !== "function") return false;
+  try {
+    const isMedia = typeof content !== "string";
+    return Boolean(await client.pupPage.evaluate(pageHasOutgoing, isMedia ? "" : content.trim(), isMedia, since));
+  } catch (err) {
+    log.warn(`[send] could not inspect WhatsApp's message store: ${firstLine(err)}`);
+    return false;
+  }
+}
+
+// Did a failed attempt actually send the message? Either signal is enough; resending after it = duplicates.
+async function wasDispatched(client, watch, content, since, log) {
+  if (watch.created()) return true;
+  if (await storeHasOutgoing(client, content, since, log)) return true;
+  if (!watch.supported) return false;
+  await sleep(config.graceMs);
+  return Boolean(watch.created());
+}
+
+function withTimeout(promise, ms, id) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new BridgeError(`WhatsApp did not answer within ${Math.round(ms / 1000)}s while sending to ${id}.`, 504, "send_timeout")),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function sendWithFallback(client, to, content, options = {}, log = console) {
+  return serialized(() => send(client, to, content, options, log));
+}
+
+async function send(client, to, content, options, log) {
+  const target = normalizeTarget(to);
+  const sendOptions = { ...options, sendSeen: false };
   const firstId = target.kind === "phone" && target.bare ? await verifyRegistered(client, target, log) : target.id;
 
   const failures = [];
+  const delivered = (id, via, message) => {
+    if (via !== "direct") log.info(`[send] delivered via ${via} (${id})`);
+    return { to: id, via, messageId: message && message.id && message.id._serialized };
+  };
+
   const attempt = async (id, via) => {
+    const watch = watchDispatch(client, content);
+    const since = Math.floor(Date.now() / 1000);
     try {
-      const sent = await client.sendMessage(id, content, sendOptions);
-      if (!sent) throw new ChatNotOpenedError(id);
-      if (via !== "direct") log.info(`[send] delivered via ${via} (${id})`);
-      return { to: id, via, messageId: sent.id && sent.id._serialized };
+      const sent = await withTimeout(client.sendMessage(id, content, sendOptions), config.attemptTimeoutMs, id);
+      if (sent) return delivered(id, via, sent);
+      // Resolved with nothing: either the chat couldn't be opened, or it was sent but not found again.
+      if (await wasDispatched(client, watch, content, since, log)) return delivered(id, `${via}, library returned no message`, watch.created());
+      failures.push(`${via} ${id}: ${new ChatNotOpenedError(id).message}`);
+      return null;
     } catch (err) {
-      if (!isRecoverable(err)) throw toBridgeError(err); // not a LID problem: report, never retry
+      // It threw. If the message was already created it IS on its way, so never resend it.
+      if (await wasDispatched(client, watch, content, since, log)) {
+        log.warn(`[send] WhatsApp reported "${firstLine(err)}" AFTER the message was sent; not retrying`);
+        return delivered(id, `${via}, error after send ignored`, watch.created());
+      }
+      if (!isRecoverable(err)) throw toBridgeError(err);
       failures.push(`${via} ${id}: ${firstLine(err)}`);
       return null;
+    } finally {
+      watch.stop();
     }
   };
 
@@ -184,8 +276,6 @@ async function sendWithFallback(client, to, content, options = {}, log = console
   if (done) return done;
 
   if (target.kind !== "passthrough") {
-    // Establish the mapping, then retry the same id (the lookup is the actual fix),
-    // followed by any other id the lookup revealed.
     const mapping = await lookupMapping(client, firstId, log);
     const candidates = [...new Set([firstId, mapping.lid, mapping.pn].filter(Boolean))];
     for (const id of candidates) {
